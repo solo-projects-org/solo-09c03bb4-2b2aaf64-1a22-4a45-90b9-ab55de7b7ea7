@@ -5,6 +5,9 @@ Only the subset required by the water-level compaction service is implemented:
 * JSON (line-delimited) transaction logs numbered contiguously from 0
 * ``protocol`` (1, 2), ``metaData`` (un-partitioned), ``add`` / ``remove``
   actions and ``commitInfo``
+* ``isolate`` actions: station/time-range isolation marks committed atomically
+  in the log (parquet files are never rewritten); they hide matching rows
+  from the available-observations query while raw snapshots stay readable
 * snapshot replay with time travel
 * optimistic concurrency control: an atomic ``link`` + unlink makes committing
   a new log version race free, conflicts are detected by re-reading the log
@@ -28,6 +31,7 @@ from pathlib import Path
 from typing import Any, Iterable, Sequence
 
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 # ---------------------------------------------------------------------------
@@ -106,6 +110,24 @@ class SnapshotEntry:
     modification_time: int
 
 
+@dataclass(frozen=True)
+class IsolationMark:
+    """One committed station/time-range isolation mark.
+
+    A mark hides every row of ``station`` with
+    ``start_utc_seconds <= utc_seconds < end_utc_seconds`` from the
+    available-observations query, whenever that row was appended.  Marks are
+    append-only: they accumulate in the log and are never rewritten or
+    removed, so every historical version keeps its own effective mark set.
+    """
+
+    mark_id: str
+    station: str
+    start_utc_seconds: int
+    end_utc_seconds: int
+    timestamp: int
+
+
 @dataclass
 class Snapshot:
     version: int
@@ -113,6 +135,10 @@ class Snapshot:
     schema_json: dict[str, Any]
     protocol: tuple[int, int]
     metadata: dict[str, Any]
+    # Isolation marks committed up to (and including) this version, in log
+    # order.  Replayed from the same log range as ``active``, so a reader of
+    # one snapshot never mixes marks and data files of different versions.
+    isolations: list[IsolationMark] = field(default_factory=list)
     # Ordered action history of this version only is not retained; callers
     # needing it replay via read_log().
 
@@ -239,6 +265,7 @@ def load_snapshot(table: Path, version: int | None = None) -> Snapshot:
     schema_json: dict[str, Any] | None = None
     protocol: tuple[int, int] | None = None
     metadata: dict[str, Any] = {}
+    isolations: list[IsolationMark] = []
 
     for v in range(0, version + 1):
         for action in read_log(table, v):
@@ -253,6 +280,8 @@ def load_snapshot(table: Path, version: int | None = None) -> Snapshot:
                 )
             elif "remove" in action:
                 active.pop(action["remove"]["path"], None)
+            elif "isolate" in action:
+                isolations.append(_parse_isolate(action["isolate"], v))
             elif "metaData" in action:
                 md = action["metaData"]
                 schema_json = md.get("schemaString")
@@ -273,7 +302,37 @@ def load_snapshot(table: Path, version: int | None = None) -> Snapshot:
         schema_json=schema_json,
         protocol=protocol,
         metadata=metadata,
+        isolations=isolations,
     )
+
+
+def _parse_isolate(payload: Any, version: int) -> IsolationMark:
+    """Validate one ``isolate`` action payload from the log."""
+    try:
+        station = payload["station"]
+        start = payload["startUtcSeconds"]
+        end = payload["endUtcSeconds"]
+        if (
+            not isinstance(station, str)
+            or not station
+            or not isinstance(start, int)
+            or not isinstance(end, int)
+            or isinstance(start, bool)
+            or isinstance(end, bool)
+            or start >= end
+        ):
+            raise ValueError("bad station or range")
+        return IsolationMark(
+            mark_id=str(payload.get("id", "")),
+            station=station,
+            start_utc_seconds=start,
+            end_utc_seconds=end,
+            timestamp=int(payload.get("timestamp", 0)),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise TableCorruptError(
+            f"invalid isolate action at log version {version}: {payload!r}"
+        ) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -607,22 +666,167 @@ def _safe_unlink(path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Station/time-range isolation
+# ---------------------------------------------------------------------------
+
+_INT64_MIN = -(2**63)
+_INT64_MAX = 2**63 - 1
+
+
+def _validate_isolation(station: Any, start: Any, end: Any) -> None:
+    if not isinstance(station, str) or not station or "\x00" in station:
+        raise InvalidRequestError("station must be a non-empty string")
+    for name, value in (("start_utc_seconds", start), ("end_utc_seconds", end)):
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise InvalidRequestError(f"{name} must be an integer (UTC seconds)")
+        if not (_INT64_MIN <= value <= _INT64_MAX):
+            raise InvalidRequestError(f"{name} is outside the int64 range")
+    if start >= end:
+        raise InvalidRequestError(
+            "start_utc_seconds must be < end_utc_seconds "
+            "(the isolated interval is [start, end))"
+        )
+
+
+def isolate_range(
+    table: Path,
+    station: str,
+    start_utc_seconds: int,
+    end_utc_seconds: int,
+    *,
+    max_retries: int = 25,
+) -> dict[str, Any]:
+    """Commit an isolation mark for *station* over [start, end) UTC seconds.
+
+    The mark is a single ``isolate`` action appended to the transaction log
+    with the same atomic link-based commit as every other transaction:
+
+    * parquet files are never rewritten and the raw snapshots stay readable
+    * the mark becomes visible exactly at its committed version; a failed
+      publish leaves at most an ignored ``.tmp-*`` file, never half a mark
+    * concurrent marks from several replicas are serialised by OCC retries,
+      so overlapping ranges never lose coverage
+    """
+    table = Path(table)
+    _validate_isolation(station, start_utc_seconds, end_utc_seconds)
+    mark_id = uuid.uuid4().hex
+
+    for attempt in range(1, max_retries + 1):
+        base = load_snapshot(table).version
+        now = _utc_now_ms()
+        actions = [
+            {
+                "commitInfo": {
+                    "timestamp": now,
+                    "operation": "ISOLATE",
+                    "operationParameters": {
+                        "station": station,
+                        "startUtcSeconds": start_utc_seconds,
+                        "endUtcSeconds": end_utc_seconds,
+                    },
+                    "readVersion": base,
+                    "isBlindAppend": True,
+                    "engineInfo": "delta-compaction-api/1.0",
+                    "clientVersion": "delta-compaction-api/1.0",
+                }
+            },
+            {
+                "isolate": {
+                    "id": mark_id,
+                    "station": station,
+                    "startUtcSeconds": start_utc_seconds,
+                    "endUtcSeconds": end_utc_seconds,
+                    "timestamp": now,
+                    "dataChange": False,
+                }
+            },
+        ]
+        try:
+            version = _commit_actions(table, base_version=base, actions=actions)
+        except ConflictError:
+            if attempt >= max_retries:
+                raise ConflictError(
+                    "too many concurrent commits while isolating"
+                ) from None
+            time.sleep(0.02 * attempt)
+            continue
+        return {
+            "version": version,
+            "mark_id": mark_id,
+            "station": station,
+            "start_utc_seconds": start_utc_seconds,
+            "end_utc_seconds": end_utc_seconds,
+            "attempts": attempt,
+        }
+    raise ConflictError("too many concurrent commits while isolating")  # pragma: no cover
+
+
+# ---------------------------------------------------------------------------
 # Read helpers
 # ---------------------------------------------------------------------------
+
+
+def _read_snapshot_data(
+    table: Path, snap: Snapshot, columns: Iterable[str] | None = None
+) -> pa.Table:
+    """Read exactly the files active in *snap* (no fresh log lookup)."""
+    if not snap.active:
+        return TABLE_SCHEMA.empty_table()
+    frames = [
+        pq.read_table(
+            _relative_data_path(table, rel),
+            columns=list(columns) if columns else None,
+        )
+        for rel in sorted(snap.active)
+    ]
+    return pa.concat_tables(frames, promote_options="none")
 
 
 def read_table(
     table: Path, version: int | None = None, columns: Iterable[str] | None = None
 ) -> pa.Table:
     """Read the full snapshot at *version* (time travel when given)."""
+    table = Path(table)
     snap = load_snapshot(table, version)
-    if not snap.active:
-        return TABLE_SCHEMA.empty_table()
-    frames = [
-        pq.read_table(_relative_data_path(table, rel), columns=list(columns) if columns else None)
-        for rel in sorted(snap.active)
-    ]
-    return pa.concat_tables(frames, promote_options="none")
+    return _read_snapshot_data(table, snap, columns)
+
+
+def read_available(
+    table: Path, version: int | None = None
+) -> tuple[pa.Table, int, Snapshot]:
+    """Available (non-isolated) observations at *version*.
+
+    Returns ``(available_rows, excluded_count, snapshot)``.  Both the data
+    files and the isolation marks come from ONE snapshot replay of the same
+    version, so a query never mixes observations and marks of different
+    versions.
+
+    A row is excluded when ANY committed mark covers it
+    (``station`` equal, ``start <= utc_seconds < end``).  Marks apply to
+    matching rows whenever those rows were appended, and a row covered by
+    several overlapping marks is still excluded (and counted) only once.
+    """
+    table = Path(table)
+    snap = load_snapshot(table, version)
+    data = _read_snapshot_data(table, snap)
+    if not snap.isolations or data.num_rows == 0:
+        return data, 0, snap
+
+    stations = data.column("station")
+    ts = data.column("utc_seconds")
+    mask: pa.ChunkedArray | pa.BooleanArray | None = None
+    for mark in snap.isolations:
+        cond = pc.and_(
+            pc.equal(stations, mark.station),
+            pc.and_(
+                pc.greater_equal(ts, mark.start_utc_seconds),
+                pc.less(ts, mark.end_utc_seconds),
+            ),
+        )
+        mask = cond if mask is None else pc.or_(mask, cond)
+    excluded = pc.sum(pc.cast(mask, pa.int64())).as_py() or 0
+    available = data.filter(pc.invert(mask))
+    return available, int(excluded), snap
 
 
 def cleanup_staging(table: Path, *, older_than_seconds: int = 3600) -> list[str]:

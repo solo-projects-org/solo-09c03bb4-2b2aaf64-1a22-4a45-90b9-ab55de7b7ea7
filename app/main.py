@@ -84,6 +84,59 @@ class TableStatsResponse(BaseModel):
     staging_orphans_cleaned: list[str]
 
 
+class IsolationRequest(BaseModel):
+    station: str = Field(
+        ..., min_length=1, description="Station id whose observations are isolated."
+    )
+    start_utc_seconds: int = Field(
+        ..., description="Outage start in UTC seconds (inclusive)."
+    )
+    end_utc_seconds: int = Field(
+        ..., description="Outage end in UTC seconds (exclusive)."
+    )
+
+
+class IsolationResponse(BaseModel):
+    table: str
+    mark_id: str
+    station: str
+    start_utc_seconds: int
+    end_utc_seconds: int
+    committed_version: int
+    attempts: int
+
+
+class IsolationMarkOut(BaseModel):
+    mark_id: str
+    station: str
+    start_utc_seconds: int
+    end_utc_seconds: int
+
+
+class IsolationListResponse(BaseModel):
+    table: str
+    version: int
+    latest_version: int
+    mark_count: int
+    marks: list[IsolationMarkOut]
+
+
+class ObservationRow(BaseModel):
+    station: str
+    utc_seconds: int
+    level_mm: int
+
+
+class AvailableObservationsResponse(BaseModel):
+    table: str
+    version: int
+    latest_version: int
+    available_count: int
+    excluded_count: int
+    isolation_mark_count: int
+    rows: list[ObservationRow]
+
+
 # ---------------------------------------------------------------------------
 # Lifespan
 # ---------------------------------------------------------------------------
@@ -108,9 +161,13 @@ app = FastAPI(
         "with dataChange=false and preserve every value, duplicate row, "
         "the schema and all old snapshots. Optimistic concurrency control "
         "lets external writers keep committing; the compaction only "
-        "replaces its selected files while all of them are still active."
+        "replaces its selected files while all of them are still active. "
+        "Station/time-range isolation marks are committed as atomic "
+        "`isolate` log actions: they hide instrument-outage observations "
+        "from the available-observations query without rewriting parquet, "
+        "so raw snapshots stay readable for review."
     ),
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -212,4 +269,97 @@ def stats() -> TableStatsResponse:
             for f in table.schema
         ],
         staging_orphans_cleaned=cleaned,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Isolation of instrument-outage observations
+# ---------------------------------------------------------------------------
+
+
+@app.post("/isolation", response_model=IsolationResponse, tags=["isolation"])
+def create_isolation(req: IsolationRequest) -> IsolationResponse:
+    """Isolate one station's observations inside [start, end) UTC seconds.
+
+    The mark is committed as a single atomic Delta log action; parquet files
+    are never rewritten and the raw values remain readable in every snapshot
+    for review.  The mark applies to matching rows whenever they were (or
+    will be) appended.
+    """
+    try:
+        result = delta.isolate_range(
+            TABLE_DIR, req.station, req.start_utc_seconds, req.end_utc_seconds
+        )
+    except delta.DeltaError as exc:
+        raise _delta_http(exc)
+    return IsolationResponse(
+        table=TABLE_NAME,
+        mark_id=result["mark_id"],
+        station=result["station"],
+        start_utc_seconds=result["start_utc_seconds"],
+        end_utc_seconds=result["end_utc_seconds"],
+        committed_version=result["version"],
+        attempts=result["attempts"],
+    )
+
+
+@app.get("/isolation", response_model=IsolationListResponse, tags=["isolation"])
+def list_isolation(version: int | None = None) -> IsolationListResponse:
+    """List the isolation marks effective at a version (default: latest)."""
+    try:
+        snap = delta.load_snapshot(TABLE_DIR, version)
+        latest = delta.list_versions(TABLE_DIR)[-1]
+    except delta.DeltaError as exc:
+        raise _delta_http(exc)
+    marks = sorted(
+        snap.isolations,
+        key=lambda m: (m.station, m.start_utc_seconds, m.end_utc_seconds, m.mark_id),
+    )
+    return IsolationListResponse(
+        table=TABLE_NAME,
+        version=snap.version,
+        latest_version=latest,
+        mark_count=len(marks),
+        marks=[
+            IsolationMarkOut(
+                mark_id=m.mark_id,
+                station=m.station,
+                start_utc_seconds=m.start_utc_seconds,
+                end_utc_seconds=m.end_utc_seconds,
+            )
+            for m in marks
+        ],
+    )
+
+
+@app.get(
+    "/observations/available",
+    response_model=AvailableObservationsResponse,
+    tags=["isolation"],
+)
+def available_observations(version: int | None = None) -> AvailableObservationsResponse:
+    """Observations usable for forecasting at a version (default: latest).
+
+    Reads the raw parquet files active at that version together with the
+    isolation marks committed up to that same version, and returns the rows
+    not covered by any mark plus the number of excluded rows.  Raw snapshots
+    (`GET /table/snapshot`) are unaffected.
+    """
+    try:
+        available, excluded, snap = delta.read_available(TABLE_DIR, version)
+        latest = delta.list_versions(TABLE_DIR)[-1]
+    except delta.DeltaError as exc:
+        raise _delta_http(exc)
+    rows = sorted(
+        (ObservationRow(**r) for r in available.to_pylist()),
+        key=lambda r: (r.station, r.utc_seconds, r.level_mm),
+    )
+    return AvailableObservationsResponse(
+        table=TABLE_NAME,
+        version=snap.version,
+        latest_version=latest,
+        available_count=len(rows),
+        excluded_count=excluded,
+        isolation_mark_count=len(snap.isolations),
+        rows=rows,
     )

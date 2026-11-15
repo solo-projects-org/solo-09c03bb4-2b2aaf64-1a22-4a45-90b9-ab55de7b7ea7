@@ -56,7 +56,14 @@ def test_log_files_are_line_delimited_json(table: Path) -> None:
         assert actions and all(isinstance(a, dict) for a in actions)
         # Every action must be one of the documented Delta action types.
         for action in actions:
-            assert set(action) <= {"protocol", "metaData", "add", "remove", "commitInfo"}
+            assert set(action) <= {
+                "protocol",
+                "metaData",
+                "add",
+                "remove",
+                "isolate",
+                "commitInfo",
+            }
 
 
 # ---------------------------------------------------------------------------
